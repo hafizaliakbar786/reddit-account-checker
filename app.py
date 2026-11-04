@@ -1,13 +1,19 @@
-import math
-import requests
+import os
+import re
+from urllib.parse import urlsplit
+from pathlib import Path
+from dotenv import load_dotenv
+from reddit_client import RedditClient, RedditAccessError
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 from flask import Flask, request, render_template_string
 
 app = Flask(__name__)
 
-USER_AGENT = "RedditAccountChecker/2.0 by RUMI"
+load_dotenv(Path(__file__).with_name(".env"))
+reddit = RedditClient()
+app.config["MAX_CONTENT_LENGTH"] = 16384
 
 HTML_TEMPLATE = """
 <!doctype html>
@@ -498,6 +504,141 @@ HTML_TEMPLATE = """
         padding: 14px;
       }
     }
+    /* White and orange theme */
+html[data-theme] {
+  --text-dark: #202124;
+  --text-light: #202124;
+  --muted-dark: #667085;
+  --muted-light: #667085;
+  --border-dark: #e5e7eb;
+  --border-light: #e5e7eb;
+  --accent-dark: #c43b00;
+  --accent-light: #c43b00;
+}
+
+html[data-theme] body {
+  background: #f6f7f8;
+  color: #202124;
+}
+
+html[data-theme] .app-shell {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  box-shadow: 0 12px 36px rgba(16, 24, 40, 0.08);
+  backdrop-filter: none;
+}
+
+html[data-theme] .title {
+  color: #c43b00;
+}
+
+html[data-theme] .title-pill {
+  background: #fff1e8;
+  color: #a83200;
+  border-color: #ffcfb8;
+}
+
+html[data-theme] .card {
+  background: #ffffff;
+  border-color: #e5e7eb;
+}
+
+html[data-theme] textarea {
+  background: #fafafa;
+  color: #202124;
+  border: 1px solid #d0d5dd;
+}
+
+html[data-theme] textarea::placeholder {
+  color: #667085;
+}
+
+html[data-theme] textarea:focus {
+  border-color: #e64400;
+  box-shadow: 0 0 0 3px rgba(230, 68, 0, 0.12);
+}
+
+html[data-theme] .btn-primary {
+  background: linear-gradient(135deg, #c43b00, #e64400);
+  color: #ffffff;
+  box-shadow: 0 4px 12px rgba(196, 59, 0, 0.18);
+}
+
+html[data-theme] .btn-primary:hover {
+  background: #b53600;
+  box-shadow: 0 6px 16px rgba(196, 59, 0, 0.24);
+}
+
+html[data-theme] .chip {
+  background: #f9fafb;
+  color: #667085;
+  border-color: #e5e7eb;
+}
+
+html[data-theme] .table-wrapper {
+  background: #ffffff;
+  border-color: #e5e7eb;
+}
+
+html[data-theme] thead {
+  background: #fff1e8;
+  color: #9a3000;
+}
+
+html[data-theme] th {
+  border-bottom: 1px solid #ffd6c2;
+}
+
+html[data-theme] tbody tr {
+  border-bottom: 1px solid #eef0f2;
+}
+
+html[data-theme] tbody tr:nth-child(even) {
+  background: #fafafa;
+}
+
+html[data-theme] tbody tr:hover {
+  background: #fff8f3;
+}
+
+html[data-theme] .btn-overview {
+  background: #fff1e8;
+  color: #a83200;
+}
+
+html[data-theme] .btn-overview:hover {
+  background: #ffe0cc;
+}
+
+html[data-theme] .btn-overview.disabled {
+  background: #f2f4f7;
+  color: #667085;
+  opacity: 1;
+}
+
+html[data-theme] .status-active {
+  background: #ecfdf3;
+  color: #166534;
+  border-color: #a7e3bc;
+}
+
+html[data-theme] .status-inactive {
+  background: #fffbeb;
+  color: #92400e;
+  border-color: #fcd68a;
+}
+
+html[data-theme] .status-error,
+html[data-theme] .error-banner {
+  background: #fff1f2;
+  color: #b42318;
+  border-color: #fecdd3;
+}
+
+/* Hide theme switch while using the fixed white theme */
+html[data-theme] .theme-toggle {
+  display: none;
+}
   </style>
 </head>
 <body>
@@ -509,7 +650,7 @@ HTML_TEMPLATE = """
           <span class="title-pill">Multi account · Live data</span>
         </div>
         <div class="subtitle">
-          Paste 1, 10, or 100 Reddit usernames. Get post karma, comment karma, age, status, and quick overview links.
+          Paste up to 10 Reddit usernames. Get post karma, comment karma, age, status, and quick overview links.
         </div>
       </div>
       <div class="controls">
@@ -561,7 +702,7 @@ example_user3" required>{{ usernames_text or "" }}</textarea>
           <strong>{{ results|length }}</strong> account(s) checked.
         </div>
         <div>
-          Active accounts have a <strong>View overview</strong> button.
+          Available profiles have a <strong>View overview</strong> button.
         </div>
       </div>
 
@@ -596,7 +737,7 @@ example_user3" required>{{ usernames_text or "" }}</textarea>
               </td>
               <td>
                 {% if r.overview_url and r.status_code == "active" %}
-                  <a href="{{ r.overview_url }}" target="_blank" class="btn-overview">
+                  <a href="{{ r.overview_url }}" target="_blank" rel="noopener noreferrer" class="btn-overview">
                     <span>View overview</span> ↗
                   </a>
                 {% else %}
@@ -612,7 +753,7 @@ example_user3" required>{{ usernames_text or "" }}</textarea>
       </div>
 
       <div class="small-note">
-        Note: Status detection (active vs suspended/banned/deleted) is best-effort based on Reddit responses.
+        Note: Karma does not establish account activity. Access errors do not establish account bans.
       </div>
     </div>
     {% endif %}
@@ -659,9 +800,18 @@ def normalize_username(name: str) -> str:
     name = name.strip()
     if not name:
         return ""
-    if name.lower().startswith("u/"):
-        name = name[2:]
-    return name.strip()
+    if name.startswith(("https://", "http://")):
+        parsed = urlsplit(name)
+        if parsed.hostname not in {"reddit.com", "www.reddit.com", "old.reddit.com"}:
+            raise ValueError("Only Reddit profile links are accepted.")
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) != 2 or parts[0].lower() not in {"u", "user"}:
+            raise ValueError("Enter a Reddit profile URL, not a post URL.")
+        name = parts[1]
+    name = re.sub(r"^/?u/", "", name, flags=re.I)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", name):
+        raise ValueError("Invalid username. Use letters, digits, underscore or hyphen; maximum 20 characters.")
+    return name
 
 def format_age(created_utc: float) -> str:
     try:
@@ -709,50 +859,29 @@ def detect_status_and_data(username: str) -> dict:
         "overview_url": None
     }
 
-    url = f"https://www.reddit.com/user/{username}/about.json"
-    headers = {"User-Agent": USER_AGENT}
-
     try:
-        resp = requests.get(url, headers=headers, timeout=8)
-    except Exception:
-        base_result["status_text"] = "Error fetching data"
+        data = reddit.about(username)
+        if data.get("is_suspended"):
+            base_result["status_text"] = "Suspended (reported by Reddit)"
+            return base_result
+        values = [data[key] for key in ("link_karma", "comment_karma", "total_karma")]
+        if not all(type(value) is int for value in values):
+            raise ValueError()
+        created = data["created_utc"]
+        if type(created) not in (int, float) or not 0 <= created <= datetime.now(timezone.utc).timestamp():
+            raise ValueError()
+        age = format_age(created)
+        if age == "Unknown":
+            raise ValueError()
+    except RedditAccessError as error:
+        base_result["status_text"] = str(error)
         return base_result
-
-    if resp.status_code != 200:
-        # Best-effort: could be suspended, banned, deleted or not found.
-        if resp.status_code == 404:
-            base_result["status_text"] = "Not found / suspended / deleted"
-        else:
-            base_result["status_text"] = f"API error ({resp.status_code})"
+    except (KeyError, TypeError, ValueError):
+        base_result["status_text"] = "Incomplete profile data; karma unavailable"
         return base_result
-
-    try:
-        data = resp.json().get("data", {})
-    except Exception:
-        base_result["status_text"] = "Invalid response data"
-        return base_result
-
-    post_karma = data.get("link_karma", 0)
-    comment_karma = data.get("comment_karma", 0)
-    total_karma = data.get("total_karma", post_karma + comment_karma)
-    created_utc = data.get("created_utc", None)
-
-    base_result["post_karma"] = post_karma
-    base_result["comment_karma"] = comment_karma
-    base_result["total_karma"] = total_karma
-    if created_utc is not None:
-        base_result["age"] = format_age(created_utc)
-
-    # Simple "activity" heuristic:
-    # if both post/comment karma are zero, call it "inactive"
-    if post_karma == 0 and comment_karma == 0:
-        base_result["status_text"] = "Inactive (no karma yet)"
-        base_result["status_code"] = "inactive"
-        base_result["overview_url"] = f"https://www.reddit.com/user/{username}/"
-    else:
-        base_result["status_text"] = "Active"
-        base_result["status_code"] = "active"
-        base_result["overview_url"] = f"https://www.reddit.com/user/{username}/"
+    base_result.update(post_karma=values[0], comment_karma=values[1],
+        total_karma=values[2], age=age, status_text="Profile available",
+        status_code="active", overview_url=f"https://www.reddit.com/user/{username}/")
 
     return base_result
 
@@ -765,22 +894,22 @@ def index():
     if request.method == "POST":
         usernames_text = request.form.get("usernames", "")
         raw_lines = usernames_text.splitlines()
-        cleaned = [normalize_username(line) for line in raw_lines]
+        try:
+            cleaned = [normalize_username(line) for line in raw_lines]
+        except ValueError as error:
+            return render_template_string(HTML_TEMPLATE, usernames_text=usernames_text,
+                results=[], error_message=str(error))
         cleaned = [u for u in cleaned if u]
-        cleaned = list(dict.fromkeys(cleaned))  # dedupe, keep order
+        cleaned = list({u.lower(): u for u in reversed(cleaned)}.values())[::-1]  # dedupe, keep order
 
         if not cleaned:
             error_message = "Please enter at least one valid username."
         else:
-            if len(cleaned) > 200:
-                cleaned = cleaned[:200]
-                error_message = "Limited to first 200 usernames for this check."
+            if len(cleaned) > 10:
+                cleaned = cleaned[:10]
+                error_message = "Limited to 10 usernames per check while API access is verified."
 
-            with ThreadPoolExecutor(max_workers=16) as executor:
-                futures = {executor.submit(detect_status_and_data, u): u for u in cleaned}
-                for future in as_completed(futures):
-                    res = future.result()
-                    results.append(res)
+            results = [detect_status_and_data(u) for u in cleaned]
 
             # preserve original order by re-sorting
             order_map = {name: idx for idx, name in enumerate(cleaned)}
@@ -793,8 +922,11 @@ def index():
         error_message=error_message
     )
 
-import os
+@app.after_request
+def prevent_cache(response):
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="127.0.0.1", port=port)
